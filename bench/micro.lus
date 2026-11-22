@@ -1,0 +1,34 @@
+-- Measures the cost of one call at a disabled level, at an enabled level,
+-- and through a child logger with redaction.
+-- Usage: lus bench/micro.lus
+local HERE = string.match(arg[0], "^(.*)[/\\][^/\\]*$") or "."
+pledge("load", "fs:read")
+package.path = HERE .. "/../?.lus;" .. package.path
+local log = require("log")
+
+local N = 2000000
+local sink = function() end
+local logger = log.new({ level = "info", write = sink })
+local child = logger:child({ component = "db", pool = 3 })
+local redacting = log.new({ level = "info", write = sink, redact = { "password", "user.token" } })
+local empty = { debug = function() end }
+local fields = { host = "localhost", ms = 12 }
+local secret = { password = "x", user = { name = "ada", token = "t" } }
+
+local function run(name, f)
+    local t = os.clock()
+    for _ = 1, N do
+        f()
+    end
+    print(string.format("%-28s %8.1f ns/call", name, (os.clock() - t) / N * 1e9))
+end
+
+for _ = 1, 2 do
+    run("empty method", function() empty:debug("query", fields) end)
+    run("disabled level", function() logger:debug("query", fields) end)
+    run("enabled, message only", function() logger:info("query") end)
+    run("enabled, two fields", function() logger:info("query", fields) end)
+    run("child, two fields", function() child:info("query", fields) end)
+    run("redacted, nested", function() redacting:info("login", secret) end)
+    run("tojson of the fields", function() return tojson(fields) end)
+end

@@ -1,0 +1,373 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
+pledge("load", "fs")
+package.path = ROOT .. "/?.lus;" .. PACKAGES .. "/web/?.lus;" .. PACKAGES .. "/atmos-web/?.lus;" .. package.path
+
+local log = require("log")
+local web = require("web")
+
+-- Returns a logger that collects its lines, and the list of lines.
+local function capture(options)
+    local lines = {}
+    options = options or {}
+    options.write = function(line) lines[#lines + 1] = line end
+    if options.time == nil then
+        options.time = false
+    end
+    return log.new(options), lines
+end
+
+local function line_shape_test()
+    local logger, lines = capture()
+    logger:info("hello", { n = 1 })
+    assert(lines[1] == '{"level":"info","msg":"hello","n":1}\n')
+    logger:warn("plain")
+    assert(lines[2] == '{"level":"warn","msg":"plain"}\n')
+end
+
+local function time_field_test()
+    local lines = {}
+    local logger = log.new({ write = function(line) lines[#lines + 1] = line end })
+    local before = os.time() * 1000
+    logger:info("x")
+    local record = fromjson(lines[1])
+    assert(math.type(record.time) == "integer")
+    assert(record.time >= before and record.time <= before + 5000)
+    logger = log.new({ write = function(line) lines[#lines + 1] = line end, time = function() return '"T"' end })
+    logger:info("x")
+    assert(lines[2] == '{"level":"info","time":"T","msg":"x"}\n')
+end
+
+local function levels_test()
+    local logger, lines = capture({ level = "warn" })
+    logger:trace("a")
+    logger:debug("a")
+    logger:info("a")
+    logger:warn("b")
+    logger:error("c")
+    logger:fatal("d")
+    assert(#lines == 3)
+    assert(fromjson(lines[1]).level == "warn")
+    assert(fromjson(lines[3]).level == "fatal")
+    assert(logger:enabled("error") and not logger:enabled("info"))
+    assert(logger:level() == "warn")
+end
+
+local function silent_test()
+    local logger, lines = capture({ level = "silent" })
+    logger:fatal("x")
+    assert(#lines == 0)
+    assert(logger:level() == "silent")
+end
+
+local function set_level_test()
+    local logger, lines = capture()
+    logger:debug("no")
+    logger:set_level("debug")
+    logger:debug("yes")
+    assert(#lines == 1)
+    logger:set_level(log.levels.error)
+    logger:warn("no")
+    assert(#lines == 1)
+end
+
+local function unknown_level_test()
+    raises(function() log.new({ level = "loud" }) end, "unknown level 'loud'")
+    local logger = capture()
+    raises(function() logger:set_level("verbose") end, "unknown level")
+end
+
+local function disabled_level_is_shared_noop_test()
+    local a = capture({ level = "error" })
+    local b = capture({ level = "fatal" })
+    assert(rawequal(a.debug, b.debug))
+    assert(not rawequal(a.error, b.error))
+end
+
+local function child_test()
+    local logger, lines = capture({ base = { app = "api" } })
+    local db = logger:child({ component = "db" })
+    local pool = db:child({ pool = 2 })
+    pool:info("connected", { ms = 12 })
+    assert(lines[1] == '{"level":"info","app":"api","component":"db","pool":2,"msg":"connected","ms":12}\n')
+    logger:info("root")
+    assert(lines[2] == '{"level":"info","app":"api","msg":"root"}\n')
+end
+
+local function child_level_test()
+    local logger, lines = capture()
+    local quiet = logger:child({ c = 1 }, { level = "error" })
+    quiet:info("no")
+    assert(#lines == 0)
+    local child = logger:child({ c = 2 })
+    logger:set_level("fatal")
+    child:info("still on")
+    assert(#lines == 1)
+end
+
+local function fields_only_test()
+    local logger, lines = capture()
+    logger:info({ event = "start" })
+    assert(lines[1] == '{"level":"info","event":"start"}\n')
+    logger:info("empty", {})
+    assert(lines[2] == '{"level":"info","msg":"empty"}\n')
+end
+
+local function message_types_test()
+    local logger, lines = capture()
+    logger:info(42)
+    assert(fromjson(lines[1]).msg == "42")
+    logger:info("line\nbreak \"quoted\" \u{e9}")
+    assert(select(2, lines[2]:gsub("\n", "")) == 1)
+    assert(fromjson(lines[2]).msg == "line\nbreak \"quoted\" \u{e9}")
+end
+
+local function list_fields_test()
+    local logger, lines = capture()
+    logger:info("list", { 1, 2, 3 })
+    assert(lines[1] == '{"level":"info","msg":"list","data":[1,2,3]}\n')
+end
+
+local function unencodable_fields_test()
+    local logger, lines = capture()
+    local loop = {}
+    loop.self = loop
+    logger:info("bad", loop)
+    local record = fromjson(lines[1])
+    assert(record.msg == "bad")
+    assert(record.log_error:find("circular", 1, true))
+end
+
+local function redact_test()
+    local logger, lines = capture({ redact = { "password", "user.token", "headers.authorization" } })
+    local fields = {
+        password = "hunter2",
+        user = { name = "ada", token = "abc" },
+        headers = { authorization = "Bearer x", accept = "*/*" },
+    }
+    logger:info("login", fields)
+    local record = fromjson(lines[1])
+    assert(record.password == "[redacted]")
+    assert(record.user.token == "[redacted]")
+    assert(record.user.name == "ada")
+    assert(record.headers.authorization == "[redacted]")
+    assert(record.headers.accept == "*/*")
+    assert(lines[1]:find("hunter2", 1, true) == nil)
+    assert(lines[1]:find("Bearer", 1, true) == nil)
+    -- The table of the caller keeps its values.
+    assert(fields.password == "hunter2")
+    assert(fields.user.token == "abc")
+end
+
+local function redact_wildcard_and_censor_test()
+    local logger, lines = capture({ redact = { "accounts.*.secret", "*.pin" }, censor = "***" })
+    logger:info("x", {
+        accounts = { a = { secret = "s1", id = 1 }, b = { secret = "s2", id = 2 } },
+        card = { pin = "1234" },
+        pin = "top level stays",
+    })
+    local record = fromjson(lines[1])
+    assert(record.accounts.a.secret == "***" and record.accounts.b.secret == "***")
+    assert(record.accounts.a.id == 1)
+    assert(record.card.pin == "***")
+    assert(record.pin == "top level stays")
+end
+
+local function redact_missing_and_scalar_paths_test()
+    local logger, lines = capture({ redact = { "user.token", "absent" } })
+    local fields = { user = "not a table", n = 1 }
+    logger:info("x", fields)
+    local record = fromjson(lines[1])
+    assert(record.user == "not a table" and record.n == 1 and record.absent == nil)
+end
+
+local function redact_applies_to_children_and_base_test()
+    local logger, lines = capture({ redact = { "password" }, base = { password = "base" } })
+    local child = logger:child({ password = "child", who = "me" })
+    child:info("x", { password = "call" })
+    assert(lines[1]:find("base", 1, true) == nil)
+    assert(lines[1]:find("child", 1, true) == nil)
+    assert(lines[1]:find("call", 1, true) == nil)
+    assert(lines[1]:find('"who":"me"', 1, true))
+end
+
+local function writer_object_test()
+    local sink = { lines = {} }
+    function sink:write(line) self.lines[#self.lines + 1] = line end
+    local logger = log.new({ write = sink, time = false })
+    logger:error("boom")
+    assert(sink.lines[1] == '{"level":"error","msg":"boom"}\n')
+end
+
+local function file_writer_test()
+    local path = "out.log"
+    local file = io.open(path, "w")
+    local logger = log.new({ write = file, time = false })
+    logger:info("one")
+    logger:info("two", { n = 2 })
+    file:close()
+    local got = {}
+    for line in io.lines(path) do
+        got[#got + 1] = fromjson(line)
+    end
+    assert(#got == 2 and got[1].msg == "one" and got[2].n == 2)
+end
+
+local function pretty_test()
+    local line = '{"level":"info","time":1782998100250,"msg":"connected","host":"localhost","ms":12}\n'
+    assert(log.pretty(line, { utc = true }) == "13:15:00.250 INFO  connected host=localhost ms=12\n")
+    local text = log.pretty({ level = "warn", msg = "slow", note = "two words", tags = { "a", "b" }, ok = true })
+    assert(text == 'WARN  slow note="two words" ok=true tags=["a","b"]\n')
+end
+
+local function pretty_color_test()
+    local text = log.pretty('{"level":"error","time":1782998100250,"msg":"boom","k":"v"}', { color = true, utc = true })
+    assert(text:find("\27[31mERROR\27[0m", 1, true))
+    assert(text:find("\27[2m13:15:00.250\27[0m", 1, true))
+    assert(text:find("\27[2mk=\27[0mv", 1, true))
+end
+
+local function pretty_passthrough_test()
+    assert(log.pretty("not json\n") == "not json\n")
+    assert(log.pretty("42\n") == "42\n")
+end
+
+local function pretty_option_test()
+    local logger, lines = capture({ pretty = { utc = true } })
+    logger:info("hi", { a = 1 })
+    assert(lines[1] == "INFO  hi a=1\n")
+end
+
+-- The web plugin ---------------------------------------------------------------
+
+local function logged_app(options, logger_options)
+    local logger, lines = capture(logger_options)
+    local app = web.app({ log = function() end })
+    options = options or {}
+    options.logger = logger
+    app:register(log, options)
+    app:get("/ok", function() return { ok = true } end)
+    app:get("/missing", function() web.raise(404, "nope") end)
+    app:get("/crash", function() error("kaboom") end)
+    app:get("/health", function() return "up" end)
+    app:post("/items/:id", function(req)
+        req.log:info("inside", { item = req.params.id })
+        return 201, { id = req.params.id }
+    end)
+    return app, lines
+end
+
+local function web_request_line_test()
+    local app, lines = logged_app()
+    local res = app:inject({ path = "/ok?x=1" })
+    assert(res.status == 200)
+    assert(#lines == 1)
+    local record = fromjson(lines[1])
+    assert(record.level == "info" and record.msg == "request")
+    assert(record.method == "GET" and record.path == "/ok" and record.status == 200)
+    assert(type(record.ms) == "number" and record.ms >= 0 and record.ms < 1000)
+end
+
+local function web_error_levels_test()
+    local app, lines = logged_app()
+    assert(app:inject({ path = "/missing" }).status == 404)
+    assert(app:inject({ path = "/crash" }).status == 500)
+    assert(#lines == 2)
+    local missing, crash = fromjson(lines[1]), fromjson(lines[2])
+    assert(missing.level == "warn" and missing.status == 404 and missing.err == nil)
+    assert(crash.level == "error" and crash.status == 500)
+    assert(crash.err:find("kaboom", 1, true))
+end
+
+local function web_skip_and_fields_test()
+    local app, lines = logged_app({
+        skip = function(req) return req.path == "/health" end,
+        fields = function(req) return { agent = req.headers["user-agent"] } end,
+        msg = "http",
+    })
+    app:inject({ path = "/health" })
+    assert(#lines == 0)
+    app:inject({ path = "/ok", headers = { ["User-Agent"] = "test" } })
+    local record = fromjson(lines[1])
+    assert(record.msg == "http" and record.agent == "test")
+end
+
+local function web_request_id_test()
+    local app, lines = logged_app({ request_id = true })
+    app:inject({ method = "POST", path = "/items/7", headers = { ["X-Request-Id"] = "abc-1" } })
+    assert(#lines == 2)
+    local inside, request = fromjson(lines[1]), fromjson(lines[2])
+    assert(inside.msg == "inside" and inside.id == "abc-1" and inside.item == "7")
+    assert(request.id == "abc-1" and request.status == 201)
+    app:inject({ path = "/ok" })
+    app:inject({ path = "/ok" })
+    assert(fromjson(lines[3]).id == "1" and fromjson(lines[4]).id == "2")
+end
+
+local function web_level_filter_test()
+    local app, lines = logged_app(nil, { level = "warn" })
+    app:inject({ path = "/ok" })
+    assert(#lines == 0)
+    app:inject({ path = "/missing" })
+    assert(#lines == 1)
+end
+
+local function web_not_found_handler_test()
+    local logger, lines = capture()
+    local app = web.app()
+    app:register(log, { logger = logger })
+    app:not_found(function() return 404, { error = "no route" } end)
+    assert(app:inject({ path = "/nowhere" }).status == 404)
+    assert(fromjson(lines[1]).status == 404 and fromjson(lines[1]).path == "/nowhere")
+end
+
+local function web_unmatched_requests_test()
+    local logger, lines = capture()
+    local app = web.app()
+    app:register(log, { logger = logger })
+    app:get("/only-get", function() return "ok" end)
+    assert(app:inject({ path = "/nowhere" }).status == 404)
+    assert(app:inject({ method = "POST", path = "/only-get" }).status == 405)
+    local missing, refused = fromjson(lines[1]), fromjson(lines[2])
+    assert(missing.status == 404 and missing.path == "/nowhere" and missing.level == "warn")
+    assert(refused.status == 405 and refused.method == "POST")
+end
+
+local function web_redacts_test()
+    local logger, lines = capture({ redact = { "token" } })
+    local app = web.app()
+    app:register(log, { logger = logger, fields = function(req) return { token = req.query.token } end })
+    app:get("/t", function() return "ok" end)
+    app:inject({ path = "/t?token=secret" })
+    assert(lines[1]:find("secret", 1, true) == nil)
+    assert(fromjson(lines[1]).token == "[redacted]")
+end
+
+-- A call at a disabled level stays within a small multiple of an empty
+-- method call, and far below an enabled call.
+local function disabled_level_cost_test()
+    local logger = log.new({ level = "info", write = function() end })
+    local empty = { debug = function() end }
+    local n = 300000
+    local fields = { a = 1 }
+    local function measure(target)
+        local best = math.huge
+        for _ = 1, 5 do
+            local t = os.clock()
+            for _ = 1, n do
+                target:debug("x", fields)
+            end
+            best = math.min(best, os.clock() - t)
+        end
+        return best
+    end
+    local base = measure(empty)
+    local disabled = measure(logger)
+    local t = os.clock()
+    for _ = 1, n do
+        logger:info("x", fields)
+    end
+    local enabled = os.clock() - t
+    assert(disabled < base * 5 + 0.01)
+    assert(disabled * 5 < enabled)
+end

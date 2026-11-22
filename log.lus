@@ -1,0 +1,489 @@
+--- Writes structured log records as JSON lines.
+---
+--- A logger writes one JSON object per line with the fields `level`, `time`,
+--- and `msg`, followed by the fields of the call. Child loggers add fields to
+--- every line. Named fields are redacted before a line is written. The
+--- writer is any function or any value with a `write` method, such as a
+--- file handle, and defaults to standard output. `log.pretty` formats a line
+--- for a terminal. Registered on a `web` scope, the package logs one line
+--- per request.
+---
+--- A level below the threshold of a logger is bound to an empty function, so
+--- a disabled call costs one field read and one call.
+---
+--- @package log
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-log
+
+local M = {}
+
+local type, tostring, next, pairs, ipairs, setmetatable = type, tostring, next, pairs, ipairs, setmetatable
+local tojson, fromjson = tojson, fromjson
+local now, monotonic from time
+local floor = math.floor
+
+--- The numeric value of each level name. `silent` is above every level.
+M.levels = { trace = 10, debug = 20, info = 30, warn = 40, error = 50, fatal = 60, silent = math.huge }
+
+local NAMES = { "trace", "debug", "info", "warn", "error", "fatal" }
+local LEVELS = M.levels
+
+local function noop() end
+
+local function epoch_millis()
+    local n = now()
+    return n:epoch() * 1000 + n:nanos() // 1000000
+end
+
+-- Redaction ---------------------------------------------------------------------
+
+-- Compiles dotted paths into a tree. Each node maps a key to a child node,
+-- and a node with `leaf` set replaces the value at its key.
+local function compile_redact(paths)
+    if paths == nil or #paths == 0 then
+        return nil
+    end
+    local root = { children = {} }
+    for _, path in ipairs(paths) do
+        local node = root
+        for segment in path:gmatch("[^.]+") do
+            local child = node.children[segment]
+            if child == nil then
+                child = { children = {} }
+                node.children[segment] = child
+            end
+            node = child
+        end
+        node.leaf = true
+    end
+    return root
+end
+
+local redact
+
+local function redact_key(node, value, out, key, censor)
+    local child = value[key]
+    if child == nil then
+        return out
+    end
+    local replacement
+    if node.leaf then
+        replacement = censor
+    elseif type(child) == "table" then
+        replacement = redact(node, child, censor)
+        if replacement == child then
+            return out
+        end
+    else
+        return out
+    end
+    if out == value then
+        out = {}
+        for k, v in pairs(value) do
+            out[k] = v
+        end
+    end
+    out[key] = replacement
+    return out
+end
+
+-- Returns `value` with the fields that `node` names replaced by `censor`.
+-- A table on the way to a redacted field is copied, so the table of the
+-- caller keeps its values.
+redact = function(node, value, censor)
+    local out = value
+    for key, child in pairs(node.children) do
+        if key == "*" then
+            for k in pairs(value) do
+                out = redact_key(child, value, out, k, censor)
+            end
+        else
+            out = redact_key(child, value, out, key, censor)
+        end
+    end
+    return out
+end
+
+-- Loggers -----------------------------------------------------------------------
+
+local Logger = {}
+Logger.__index = Logger
+
+-- Returns the fields as the text that follows the opening brace of an
+-- object: a comma, the members, and with `close` the closing brace.
+local function fields_text(self, fields, close)
+    if tree = self.redact then
+        fields = redact(tree, fields, self.censor)
+    end
+    local ok, text = catch tojson(fields)
+    if not ok then
+        text = '{"log_error":' .. tojson(tostring(text)) .. "}"
+    elseif text:sub(1, 1) ~= "{" then
+        text = '{"data":' .. text .. "}"
+    end
+    return "," .. (close and text:sub(2) or text:sub(2, -2))
+end
+
+local function emitter(label)
+    local head = `{"level":"$label"`
+    local timed = head .. ',"time":'
+    return function(self, msg, fields)
+        if fields == nil and type(msg) == "table" then
+            msg, fields = nil, msg
+        end
+        local clock = self.clock
+        local tail
+        if fields ~= nil and next(fields) ~= nil then
+            tail = fields_text(self, fields, true)
+        else
+            tail = "}"
+        end
+        if msg ~= nil then
+            tail = ',"msg":' .. tojson(type(msg) == "string" and msg or tostring(msg)) .. tail .. "\n"
+        else
+            tail = tail .. "\n"
+        end
+        if clock then
+            return self.write(timed .. clock() .. self.bindings .. tail)
+        end
+        return self.write(head .. self.bindings .. tail)
+    end
+end
+
+local EMIT = {}
+for _, name in ipairs(NAMES) do
+    EMIT[name] = emitter(name)
+    Logger[name] = noop
+end
+
+local function bind_levels(self, threshold)
+    self.threshold = threshold
+    for _, name in ipairs(NAMES) do
+        self[name] = LEVELS[name] >= threshold and EMIT[name] or noop
+    end
+end
+
+local function level_value(level)
+    local value = type(level) == "number" and level or LEVELS[level]
+    if value == nil then
+        error(`log: unknown level '$(tostring(level))'`, 3)
+    end
+    return value
+end
+
+local function make_writer(target)
+    if target == nil then
+        local out = io.stdout
+        return function(line) out:write(line) end
+    end
+    if type(target) == "function" then
+        return target
+    end
+    return function(line) target:write(line) end
+end
+
+--- Creates a logger.
+---
+--- The options are the following.
+---
+--- - `level`: the lowest level that is written, one of `"trace"`, `"debug"`,
+---   `"info"` (the default), `"warn"`, `"error"`, `"fatal"`, and `"silent"`.
+--- - `write`: where lines go. A function receives each line with its
+---   newline. Any other value, such as a file handle, receives it through
+---   its `write` method. The default is standard output.
+--- - `base`: a table of fields that every line carries.
+--- - `redact`: a list of field paths whose values are replaced. A path is
+---   a key or keys joined with `.`, such as `"password"` or
+---   `"user.token"`. The segment `*` matches every key of its level.
+--- - `censor`: the replacement for a redacted value, by default
+---   `"[redacted]"`.
+--- - `time`: `false` leaves the `time` field out. A function supplies its
+---   value, which must be a number or text that is valid JSON. By default
+---   the field holds Unix milliseconds.
+--- - `pretty`: `true` or a table of `log.pretty` options formats each line
+---   for a terminal before it is written.
+---
+--- Each level is a method, `logger:info(msg, fields)`. `msg` is the message
+--- and `fields` an optional table of fields to add to the line. A call
+--- with a table alone, `logger:info(fields)`, writes the fields without a
+--- message. A field named `level`, `time`, or `msg` appears next to the
+--- field of the logger, so choose other names. Fields that `tojson` cannot
+--- encode, such as a table that contains itself, are replaced by a
+--- `log_error` field that holds the reason.
+--- @param options table? The options.
+--- @return table The logger.
+function M.new(options)
+    options = options or {}
+    local self = setmetatable({}, Logger)
+    self.write = make_writer(options.write)
+    if options.pretty then
+        local pretty_options = type(options.pretty) == "table" and options.pretty or {}
+        local inner = self.write
+        if pretty_options.color == nil and options.write == nil then
+            pretty_options = { color = io.stdout:isatty(), utc = pretty_options.utc }
+        end
+        self.write = function(line)
+            return inner(M.pretty(line, pretty_options))
+        end
+    end
+    self.redact = compile_redact(options.redact)
+    self.censor = options.censor or "[redacted]"
+    if options.time == false then
+        self.clock = false
+    elseif type(options.time) == "function" then
+        self.clock = options.time
+    else
+        self.clock = epoch_millis
+    end
+    self.bindings = ""
+    if options.base and next(options.base) ~= nil then
+        self.bindings = fields_text(self, options.base, false)
+    end
+    bind_levels(self, level_value(options.level or "info"))
+    return self
+end
+
+--- Returns a logger that adds `fields` to every line.
+---
+--- The child shares the writer, the redaction, and the clock of its parent
+--- and starts at the level that its parent has at this moment. The fields
+--- are encoded once, here.
+--- @param fields table The fields to add.
+--- @param options table? `level` gives the child its own level.
+--- @return table The child logger.
+function Logger:child(fields, options)
+    local child = setmetatable({}, Logger)
+    child.write = self.write
+    child.redact = self.redact
+    child.censor = self.censor
+    child.clock = self.clock
+    child.bindings = self.bindings
+    if fields and next(fields) ~= nil then
+        child.bindings = child.bindings .. fields_text(self, fields, false)
+    end
+    local level = options and options.level
+    bind_levels(child, level and level_value(level) or self.threshold)
+    return child
+end
+
+--- Returns true if a call at `level` writes a line.
+---
+--- Guard the construction of costly fields with it.
+--- @param level string|number The level name or its numeric value.
+--- @return boolean
+function Logger:enabled(level)
+    return level_value(level) >= self.threshold
+end
+
+--- Changes the level of this logger. Existing children keep their level.
+--- @param level string|number The level name or its numeric value.
+--- @return table The logger, for chaining.
+function Logger:set_level(level)
+    bind_levels(self, level_value(level))
+    return self
+end
+
+--- Returns the name of the current level of this logger.
+--- @return string
+function Logger:level()
+    local threshold = self.threshold
+    for _, name in ipairs(NAMES) do
+        if LEVELS[name] == threshold then
+            return name
+        end
+    end
+    return threshold == math.huge and "silent" or tostring(threshold)
+end
+
+-- Pretty printing -------------------------------------------------------------------
+
+local COLORS = {
+    trace = "\27[90m",
+    debug = "\27[36m",
+    info = "\27[32m",
+    warn = "\27[33m",
+    error = "\27[31m",
+    fatal = "\27[1;31m",
+}
+local DIM, RESET = "\27[2m", "\27[0m"
+
+local function pretty_value(value)
+    if type(value) == "string" then
+        if value ~= "" and value:find("[%s\"=]") == nil then
+            return value
+        end
+        return tojson(value)
+    end
+    if type(value) == "table" then
+        return tojson(value)
+    end
+    return tostring(value)
+end
+
+--- Formats one JSON line for a terminal.
+---
+--- The result has the form `13:15:00.250 INFO  message key=value`, with
+--- the fields sorted by name and a newline at the end. A string value with
+--- spaces, quotes, or `=`, and a table value, are written as JSON. A line
+--- that is not a JSON object is returned unchanged.
+---
+--- The options are `color`, which adds ANSI colors, and `utc`, which shows
+--- the time in UTC. The time is shown in the local zone by default.
+--- @param line string|table The line, or the record it decodes to.
+--- @param options table? The options.
+--- @return string
+function M.pretty(line, options)
+    local record = line
+    if type(line) == "string" then
+        local ok, value = catch fromjson(line)
+        if not ok or type(value) ~= "table" then
+            return line
+        end
+        record = value
+    end
+    local color = options and options.color
+    local parts, n = {}, 0
+    local stamp = record.time
+    if math.type(stamp) == "integer" then
+        local instant = time.instant(stamp // 1000)
+        local clock
+        if options and options.utc then
+            clock = instant:format("%H:%M:%S")
+        else
+            clock = instant:at(time.localzone()):format("%H:%M:%S")
+        end
+        clock = string.format("%s.%03d", clock, stamp % 1000)
+        n = n + 1
+        parts[n] = color and (DIM .. clock .. RESET) or clock
+    elseif stamp ~= nil then
+        n = n + 1
+        parts[n] = tostring(stamp)
+    end
+    local level = tostring(record.level or "")
+    local label = string.format("%-5s", level:upper())
+    n = n + 1
+    parts[n] = color and COLORS[level] and (COLORS[level] .. label .. RESET) or label
+    if record.msg ~= nil then
+        n = n + 1
+        parts[n] = tostring(record.msg)
+    end
+    local keys = {}
+    for key in pairs(record) do
+        if key ~= "time" and key ~= "level" and key ~= "msg" then
+            keys[#keys + 1] = tostring(key)
+        end
+    end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+        local text = pretty_value(record[key])
+        n = n + 1
+        parts[n] = color and (DIM .. key .. "=" .. RESET .. text) or (key .. "=" .. text)
+    end
+    return table.concat(parts, " ") .. "\n"
+end
+
+-- The web plugin ----------------------------------------------------------------------
+
+local function status_level(status)
+    if status >= 500 then
+        return "error"
+    elseif status >= 400 then
+        return "warn"
+    end
+    return "info"
+end
+
+--- Registers the request log on a `web` scope, as in
+--- `app:register(log, { logger = logger })`.
+---
+--- The plugin writes one line per request with the message `request` and
+--- the fields `method`, `path`, `status`, and `ms`, the duration in
+--- milliseconds. Its level is `info` below status 400, `warn` from 400,
+--- and `error` from 500. A handler that raises an error other than a
+--- `web.raise` error gets an `err` field with the text of the error. Each
+--- request carries the logger as `req.log`.
+---
+--- The plugin applies to the scope that registers it. Registered on the
+--- application, it also logs the requests that match no route.
+---
+--- The options are the following.
+---
+--- - `logger`: the logger. The default is a new logger with the default
+---   options of `log.new`.
+--- - `skip`: a function `skip(req)`. A true result leaves the request out.
+--- - `request_id`: `true` gives each request an id, the `x-request-id`
+---   header when the client sent one and a counter otherwise. The id is in
+---   `req.id`, in the `id` field of the line, and in every line that
+---   `req.log` writes.
+--- - `fields`: a function `fields(req, status)` that returns a table of
+---   more fields for the line.
+--- - `msg`: the message of the line, by default `"request"`.
+--- @param scope table The `web` scope.
+--- @param options table? The options.
+function M.register(scope, options)
+    options = options or {}
+    local logger = options.logger or M.new()
+    local skip = options.skip
+    local with_id = options.request_id
+    local extra = options.fields
+    local msg = options.msg or "request"
+    local counter = 0
+
+    scope:hook("on_request", function(req)
+        if skip and skip(req) then
+            req.log = logger
+            return
+        end
+        if with_id then
+            local id = req.headers["x-request-id"]
+            if id == nil or id == "" or #id > 128 then
+                counter = counter + 1
+                id = tostring(counter)
+            end
+            req.id = id
+            req.log = logger:child({ id = id })
+        else
+            req.log = logger
+        end
+        req.log_start = monotonic()
+    end)
+    -- Keeps the error of a failed request for its line.
+    scope:hook("on_error", function(req, err)
+        if not (type(err) == "table" and math.type(err.status) == "integer") then
+            req.log_error = err
+        end
+    end)
+    scope:hook("on_response", function(req, status)
+        local start = req.log_start
+        if start == nil then
+            return
+        end
+        req.log_start = nil
+        local level = status_level(status)
+        local log = req.log
+        if not log:enabled(level) then
+            return
+        end
+        local ms = floor((monotonic() - start):millis() * 1000 + 0.5) / 1000
+        local fields = { method = req.method, path = req.path, status = status, ms = ms }
+        if req.log_error ~= nil then
+            fields.err = tostring(req.log_error)
+        end
+        if extra then
+            if more = extra(req, status) then
+                for k, v in pairs(more) do
+                    fields[k] = v
+                end
+            end
+        end
+        log[level](log, msg, fields)
+    end)
+end
+
+--- Registers into the scope that calls `register`, so every route of that
+--- scope is logged.
+M.shared = true
+
+return M
