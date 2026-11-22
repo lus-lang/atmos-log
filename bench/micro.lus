@@ -3,7 +3,7 @@
 -- Usage: lus bench/micro.lus
 local HERE = string.match(arg[0], "^(.*)[/\\][^/\\]*$") or "."
 pledge("load", "fs:read")
-package.path = HERE .. "/../?.lus;" .. package.path
+package.path = `$HERE/../?.lus;$(package.path)`
 local log = require("log")
 
 local N = 2000000
@@ -23,12 +23,17 @@ local function run(name, f)
     print(string.format("%-28s %8.1f ns/call", name, (os.clock() - t) / N * 1e9))
 end
 
+local cases = {
+    { "empty method", function() empty:debug("query", fields) end },
+    { "disabled level", function() logger:debug("query", fields) end },
+    { "enabled, message only", function() logger:info("query") end },
+    { "enabled, two fields", function() logger:info("query", fields) end },
+    { "child, two fields", function() child:info("query", fields) end },
+    { "redacted, nested", function() redacting:info("login", secret) end },
+    { "tojson of the fields", function() return tojson(fields) end },
+}
 for _ = 1, 2 do
-    run("empty method", function() empty:debug("query", fields) end)
-    run("disabled level", function() logger:debug("query", fields) end)
-    run("enabled, message only", function() logger:info("query") end)
-    run("enabled, two fields", function() logger:info("query", fields) end)
-    run("child, two fields", function() child:info("query", fields) end)
-    run("redacted, nested", function() redacting:info("login", secret) end)
-    run("tojson of the fields", function() return tojson(fields) end)
+    for _, case in ipairs(cases) do
+        run(case[1], case[2])
+    end
 end

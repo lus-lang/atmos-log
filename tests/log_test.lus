@@ -1,7 +1,7 @@
 local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
 local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
 pledge("load", "fs")
-package.path = ROOT .. "/?.lus;" .. PACKAGES .. "/web/?.lus;" .. PACKAGES .. "/atmos-web/?.lus;" .. package.path
+package.path = `$ROOT/?.lus;$PACKAGES/web/?.lus;$PACKAGES/atmos-web/?.lus;$(package.path)`
 
 local log = require("log")
 local web = require("web")

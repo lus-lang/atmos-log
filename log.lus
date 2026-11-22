@@ -3,16 +3,16 @@
 --- A logger writes one JSON object per line with the fields `level`, `time`,
 --- and `msg`, followed by the fields of the call. Child loggers add fields to
 --- every line. Named fields are redacted before a line is written. The
---- writer is any function or any value with a `write` method, such as a
---- file handle, and defaults to standard output. `log.pretty` formats a line
---- for a terminal. Registered on a `web` scope, the package logs one line
---- per request.
+--- writer is standard output by default, or any function or any value with
+--- a `write` method, such as a file handle. `log.pretty` formats a line for
+--- a terminal. Registered on a `web` scope, the package logs one line per
+--- request.
 ---
---- A level below the threshold of a logger is bound to an empty function, so
---- a disabled call costs one field read and one call.
+--- A level below the level of a logger is bound to an empty function, so a
+--- disabled call costs one field read and one call.
 ---
 --- @package log
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-log
@@ -119,9 +119,9 @@ local function fields_text(self, fields, close)
     end
     local ok, text = catch tojson(fields)
     if not ok then
-        text = '{"log_error":' .. tojson(tostring(text)) .. "}"
+        text = `{"log_error":$(tojson(tostring(text)))}`
     elseif text:sub(1, 1) ~= "{" then
-        text = '{"data":' .. text .. "}"
+        text = `{"data":$text}`
     end
     return "," .. (close and text:sub(2) or text:sub(2, -2))
 end
@@ -141,7 +141,7 @@ local function emitter(label)
             tail = "}"
         end
         if msg ~= nil then
-            tail = ',"msg":' .. tojson(type(msg) == "string" and msg or tostring(msg)) .. tail .. "\n"
+            tail = `,"msg":$(tojson(type(msg) == "string" and msg or tostring(msg)))$tail\n`
         else
             tail = tail .. "\n"
         end
@@ -190,16 +190,17 @@ end
 ---
 --- - `level`: the lowest level that is written, one of `"trace"`, `"debug"`,
 ---   `"info"` (the default), `"warn"`, `"error"`, `"fatal"`, and `"silent"`.
---- - `write`: where lines go. A function receives each line with its
----   newline. Any other value, such as a file handle, receives it through
----   its `write` method. The default is standard output.
+--- - `write`: the destination of the lines. A function is called with each
+---   line, including its newline. Any other value, such as a file handle,
+---   must have a `write` method, which is called with each line. The
+---   default is standard output.
 --- - `base`: a table of fields that every line carries.
 --- - `redact`: a list of field paths whose values are replaced. A path is
 ---   a key or keys joined with `.`, such as `"password"` or
 ---   `"user.token"`. The segment `*` matches every key of its level.
 --- - `censor`: the replacement for a redacted value, by default
 ---   `"[redacted]"`.
---- - `time`: `false` leaves the `time` field out. A function supplies its
+--- - `time`: `false` leaves the `time` field out. A function returns its
 ---   value, which must be a number or text that is valid JSON. By default
 ---   the field holds Unix milliseconds.
 --- - `pretty`: `true` or a table of `log.pretty` options formats each line
@@ -208,10 +209,11 @@ end
 --- Each level is a method, `logger:info(msg, fields)`. `msg` is the message
 --- and `fields` an optional table of fields to add to the line. A call
 --- with a table alone, `logger:info(fields)`, writes the fields without a
---- message. A field named `level`, `time`, or `msg` appears next to the
---- field of the logger, so choose other names. Fields that `tojson` cannot
---- encode, such as a table that contains itself, are replaced by a
---- `log_error` field that holds the reason.
+--- message. A field named `level`, `time`, or `msg` is written in addition
+--- to the field of the logger, which gives the line a duplicate key, so
+--- choose other names. Fields that `tojson` cannot encode, such as a
+--- table that contains itself, are replaced by a `log_error` field that
+--- holds the reason.
 --- @param options table? The options.
 --- @return table The logger.
 function M.new(options)
@@ -249,7 +251,7 @@ end
 ---
 --- The child shares the writer, the redaction, and the clock of its parent
 --- and starts at the level that its parent has at this moment. The fields
---- are encoded once, here.
+--- are encoded once, when the child is created.
 --- @param fields table The fields to add.
 --- @param options table? `level` gives the child its own level.
 --- @return table The child logger.
@@ -270,7 +272,7 @@ end
 
 --- Returns true if a call at `level` writes a line.
 ---
---- Guard the construction of costly fields with it.
+--- Use it to skip building costly fields when their level is disabled.
 --- @param level string|number The level name or its numeric value.
 --- @return boolean
 function Logger:enabled(level)
@@ -325,12 +327,12 @@ end
 --- Formats one JSON line for a terminal.
 ---
 --- The result has the form `13:15:00.250 INFO  message key=value`, with
---- the fields sorted by name and a newline at the end. A string value with
---- spaces, quotes, or `=`, and a table value, are written as JSON. A line
---- that is not a JSON object is returned unchanged.
+--- the fields sorted by name and a newline at the end. A string value that
+--- contains spaces, quotes, or `=` is written as JSON, as is a table value.
+--- A line that is not a JSON object is returned unchanged.
 ---
---- The options are `color`, which adds ANSI colors, and `utc`, which shows
---- the time in UTC. The time is shown in the local zone by default.
+--- `options.color` adds ANSI colors. `options.utc` shows the time in UTC,
+--- which is otherwise shown in the local zone.
 --- @param line string|table The line, or the record it decodes to.
 --- @param options table? The options.
 --- @return string
@@ -379,7 +381,7 @@ function M.pretty(line, options)
     for _, key in ipairs(keys) do
         local text = pretty_value(record[key])
         n = n + 1
-        parts[n] = color and (DIM .. key .. "=" .. RESET .. text) or (key .. "=" .. text)
+        parts[n] = color and (`$DIM$key=$RESET$text`) or (`$key=$text`)
     end
     return table.concat(parts, " ") .. "\n"
 end
@@ -401,9 +403,9 @@ end
 --- The plugin writes one line per request with the message `request` and
 --- the fields `method`, `path`, `status`, and `ms`, the duration in
 --- milliseconds. Its level is `info` below status 400, `warn` from 400,
---- and `error` from 500. A handler that raises an error other than a
---- `web.raise` error gets an `err` field with the text of the error. Each
---- request carries the logger as `req.log`.
+--- and `error` from 500. When a handler raises an error other than a
+--- `web.raise` error, the line gets an `err` field with the text of the
+--- error. Every handler can read the logger from `req.log`.
 ---
 --- The plugin applies to the scope that registers it. Registered on the
 --- application, it also logs the requests that match no route.
@@ -412,7 +414,8 @@ end
 ---
 --- - `logger`: the logger. The default is a new logger with the default
 ---   options of `log.new`.
---- - `skip`: a function `skip(req)`. A true result leaves the request out.
+--- - `skip`: a function `skip(req)`. A truthy result leaves the request out
+---   of the log.
 --- - `request_id`: `true` gives each request an id, the `x-request-id`
 ---   header when the client sent one and a counter otherwise. The id is in
 ---   `req.id`, in the `id` field of the line, and in every line that
@@ -482,8 +485,8 @@ function M.register(scope, options)
     end)
 end
 
---- Registers into the scope that calls `register`, so every route of that
---- scope is logged.
+--- `true`, so the plugin registers into the scope that calls `register` and
+--- logs every route of that scope.
 M.shared = true
 
 return M
