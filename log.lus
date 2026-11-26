@@ -11,6 +11,20 @@
 --- A level below the level of a logger is bound to an empty function, so a
 --- disabled call costs one field read and one call.
 ---
+--- The following program sets up the logging of a web application and
+--- redacts passwords and tokens from its records.
+---
+--- ```lus nocheck
+--- local log = require("https://atmosp.here/2.0/log.lus")
+---
+--- local logger = log.new({ level = "info", redact = { "password", "user.token" } })
+--- local db_log = logger:child({ component = "db" })
+--- db_log:info("connected", { ms = 12 })
+--- --> {"level":"info","time":1782998100250,"component":"db","msg":"connected","ms":12}
+---
+--- app:register(log, { logger = logger })
+--- ```
+---
 --- @package log
 --- @version 1.0.0
 --- @lus 2.0
@@ -19,18 +33,26 @@
 
 local M = {}
 
-local type, tostring, next, pairs, ipairs, setmetatable = type, tostring, next, pairs, ipairs, setmetatable
-local tojson, fromjson = tojson, fromjson
+local type, tostring, next, pairs, ipairs, setmetatable, tojson, fromjson from _G
 local now, monotonic from time
 local floor = math.floor
 
 --- The numeric value of each level name. `silent` is above every level.
-M.levels = { trace = 10, debug = 20, info = 30, warn = 40, error = 50, fatal = 60, silent = math.huge }
+M.levels = {
+    trace = 10,
+    debug = 20,
+    info = 30,
+    warn = 40,
+    error = 50,
+    fatal = 60,
+    silent = math.huge,
+}
 
 local NAMES = { "trace", "debug", "info", "warn", "error", "fatal" }
 local LEVELS = M.levels
 
-local function noop() end
+local function noop()
+end
 
 local function epoch_millis()
     local n = now()
@@ -45,19 +67,26 @@ local function compile_redact(paths)
     if paths == nil or #paths == 0 then
         return nil
     end
+
     local root = { children = {} }
+
     for _, path in ipairs(paths) do
         local node = root
+
         for segment in path:gmatch("[^.]+") do
             local child = node.children[segment]
+
             if child == nil then
                 child = { children = {} }
                 node.children[segment] = child
             end
+
             node = child
         end
+
         node.leaf = true
     end
+
     return root
 end
 
@@ -65,26 +94,29 @@ local redact
 
 local function redact_key(node, value, out, key, censor)
     local child = value[key]
+
     if child == nil then
         return out
     end
+
     local replacement
+
     if node.leaf then
         replacement = censor
     elseif type(child) == "table" then
         replacement = redact(node, child, censor)
+
         if replacement == child then
             return out
         end
     else
         return out
     end
+
     if out == value then
-        out = {}
-        for k, v in pairs(value) do
-            out[k] = v
-        end
+        out = table.clone(value)
     end
+
     out[key] = replacement
     return out
 end
@@ -94,6 +126,7 @@ end
 -- caller keeps its values.
 redact = function(node, value, censor)
     local out = value
+
     for key, child in pairs(node.children) do
         if key == "*" then
             for k in pairs(value) do
@@ -103,6 +136,7 @@ redact = function(node, value, censor)
             out = redact_key(child, value, out, key, censor)
         end
     end
+
     return out
 end
 
@@ -117,42 +151,52 @@ local function fields_text(self, fields, close)
     if tree = self.redact then
         fields = redact(tree, fields, self.censor)
     end
+
     local ok, text = catch tojson(fields)
+
     if not ok then
         text = `{"log_error":$(tojson(tostring(text)))}`
     elseif text:sub(1, 1) ~= "{" then
         text = `{"data":$text}`
     end
-    return "," .. (close and text:sub(2) or text:sub(2, -2))
+
+    return `,$(close and text:sub(2) or text:sub(2, -2))`
 end
 
 local function emitter(label)
     local head = `{"level":"$label"`
-    local timed = head .. ',"time":'
+    local timed = `$head,"time":`
+
     return function(self, msg, fields)
         if fields == nil and type(msg) == "table" then
             msg, fields = nil, msg
         end
+
         local clock = self.clock
         local tail
+
         if fields ~= nil and next(fields) ~= nil then
             tail = fields_text(self, fields, true)
         else
             tail = "}"
         end
+
         if msg ~= nil then
             tail = `,"msg":$(tojson(type(msg) == "string" and msg or tostring(msg)))$tail\n`
         else
             tail = tail .. "\n"
         end
+
         if clock then
             return self.write(timed .. clock() .. self.bindings .. tail)
         end
+
         return self.write(head .. self.bindings .. tail)
     end
 end
 
 local EMIT = {}
+
 for _, name in ipairs(NAMES) do
     EMIT[name] = emitter(name)
     Logger[name] = noop
@@ -160,6 +204,7 @@ end
 
 local function bind_levels(self, threshold)
     self.threshold = threshold
+
     for _, name in ipairs(NAMES) do
         self[name] = LEVELS[name] >= threshold and EMIT[name] or noop
     end
@@ -167,21 +212,30 @@ end
 
 local function level_value(level)
     local value = type(level) == "number" and level or LEVELS[level]
+
     if value == nil then
         error(`log: unknown level '$(tostring(level))'`, 3)
     end
+
     return value
 end
 
 local function make_writer(target)
     if target == nil then
         local out = io.stdout
-        return function(line) out:write(line) end
+
+        return function(line)
+            out:write(line)
+        end
     end
+
     if type(target) == "function" then
         return target
     end
-    return function(line) target:write(line) end
+
+    return function(line)
+        target:write(line)
+    end
 end
 
 --- Creates a logger.
@@ -220,18 +274,23 @@ function M.new(options)
     options = options or {}
     local self = setmetatable({}, Logger)
     self.write = make_writer(options.write)
+
     if options.pretty then
         local pretty_options = type(options.pretty) == "table" and options.pretty or {}
         local inner = self.write
+
         if pretty_options.color == nil and options.write == nil then
             pretty_options = { color = io.stdout:isatty(), utc = pretty_options.utc }
         end
+
         self.write = function(line)
             return inner(M.pretty(line, pretty_options))
         end
     end
+
     self.redact = compile_redact(options.redact)
     self.censor = options.censor or "[redacted]"
+
     if options.time == false then
         self.clock = false
     elseif type(options.time) == "function" then
@@ -239,10 +298,13 @@ function M.new(options)
     else
         self.clock = epoch_millis
     end
+
     self.bindings = ""
+
     if options.base and next(options.base) ~= nil then
         self.bindings = fields_text(self, options.base, false)
     end
+
     bind_levels(self, level_value(options.level or "info"))
     return self
 end
@@ -262,10 +324,12 @@ function Logger:child(fields, options)
     child.censor = self.censor
     child.clock = self.clock
     child.bindings = self.bindings
+
     if fields and next(fields) ~= nil then
         child.bindings = child.bindings .. fields_text(self, fields, false)
     end
-    local level = options and options.level
+
+    local level = options?.level
     bind_levels(child, level and level_value(level) or self.threshold)
     return child
 end
@@ -291,11 +355,13 @@ end
 --- @return string
 function Logger:level()
     local threshold = self.threshold
+
     for _, name in ipairs(NAMES) do
         if LEVELS[name] == threshold then
             return name
         end
     end
+
     return threshold == math.huge and "silent" or tostring(threshold)
 end
 
@@ -316,11 +382,14 @@ local function pretty_value(value)
         if value ~= "" and value:find("[%s\"=]") == nil then
             return value
         end
+
         return tojson(value)
     end
+
     if type(value) == "table" then
         return tojson(value)
     end
+
     return tostring(value)
 end
 
@@ -338,51 +407,58 @@ end
 --- @return string
 function M.pretty(line, options)
     local record = line
+
     if type(line) == "string" then
         local ok, value = catch fromjson(line)
+
         if not ok or type(value) ~= "table" then
             return line
         end
+
         record = value
     end
-    local color = options and options.color
+
+    local color = options?.color
     local parts, n = {}, 0
     local stamp = record.time
+
     if math.type(stamp) == "integer" then
         local instant = time.instant(stamp // 1000)
-        local clock
-        if options and options.utc then
-            clock = instant:format("%H:%M:%S")
-        else
-            clock = instant:at(time.localzone()):format("%H:%M:%S")
-        end
-        clock = string.format("%s.%03d", clock, stamp % 1000)
+        local zoned = options?.utc and instant or instant:at(time.localzone())
+        local clock = string.format("%s.%03d", zoned:format("%H:%M:%S"), stamp % 1000)
         n = n + 1
-        parts[n] = color and (DIM .. clock .. RESET) or clock
+        parts[n] = color and `$DIM$clock$RESET` or clock
     elseif stamp ~= nil then
         n = n + 1
         parts[n] = tostring(stamp)
     end
+
     local level = tostring(record.level or "")
     local label = string.format("%-5s", level:upper())
     n = n + 1
-    parts[n] = color and COLORS[level] and (COLORS[level] .. label .. RESET) or label
+    parts[n] = color and COLORS[level] and `$(COLORS[level])$label$RESET` or label
+
     if record.msg ~= nil then
         n = n + 1
         parts[n] = tostring(record.msg)
     end
+
     local keys = {}
+
     for key in pairs(record) do
         if key ~= "time" and key ~= "level" and key ~= "msg" then
             keys[#keys + 1] = tostring(key)
         end
     end
+
     table.sort(keys)
+
     for _, key in ipairs(keys) do
         local text = pretty_value(record[key])
         n = n + 1
-        parts[n] = color and (`$DIM$key=$RESET$text`) or (`$key=$text`)
+        parts[n] = color and `$DIM$key=$RESET$text` or `$key=$text`
     end
+
     return table.concat(parts, " ") .. "\n"
 end
 
@@ -394,6 +470,7 @@ local function status_level(status)
     elseif status >= 400 then
         return "warn"
     end
+
     return "info"
 end
 
@@ -435,52 +512,63 @@ function M.register(scope, options)
     local counter = 0
 
     scope:hook("on_request", function(req)
-        if skip and skip(req) then
+        if skip?(req) then
             req.log = logger
             return
         end
+
         if with_id then
             local id = req.headers["x-request-id"]
+
             if id == nil or id == "" or #id > 128 then
                 counter = counter + 1
                 id = tostring(counter)
             end
+
             req.id = id
             req.log = logger:child({ id = id })
         else
             req.log = logger
         end
+
         req.log_start = monotonic()
     end)
+
     -- Keeps the error of a failed request for its line.
     scope:hook("on_error", function(req, err)
         if not (type(err) == "table" and math.type(err.status) == "integer") then
             req.log_error = err
         end
     end)
+
     scope:hook("on_response", function(req, status)
         local start = req.log_start
+
         if start == nil then
             return
         end
+
         req.log_start = nil
         local level = status_level(status)
         local log = req.log
+
         if not log:enabled(level) then
             return
         end
+
         local ms = floor((monotonic() - start):millis() * 1000 + 0.5) / 1000
         local fields = { method = req.method, path = req.path, status = status, ms = ms }
+
         if req.log_error ~= nil then
             fields.err = tostring(req.log_error)
         end
-        if extra then
-            if more = extra(req, status) then
-                for k, v in pairs(more) do
-                    fields[k] = v
-                end
+
+        if more = extra?(req, status) then
+            for k, v in pairs(more) do
+                fields[k] = v
             end
         end
+
         log[level](log, msg, fields)
     end)
 end

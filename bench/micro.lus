@@ -7,31 +7,77 @@ package.path = `$HERE/../?.lus;$(package.path)`
 local log = require("log")
 
 local N = 2000000
-local sink = function() end
+
+local sink = function()
+end
+
 local logger = log.new({ level = "info", write = sink })
 local child = logger:child({ component = "db", pool = 3 })
 local redacting = log.new({ level = "info", write = sink, redact = { "password", "user.token" } })
-local empty = { debug = function() end }
+
+local empty = {
+    debug = function()
+    end,
+}
+
 local fields = { host = "localhost", ms = 12 }
 local secret = { password = "x", user = { name = "ada", token = "t" } }
 
 local function run(name, f)
     local t = os.clock()
+
     for _ = 1, N do
         f()
     end
+
     print(string.format("%-28s %8.1f ns/call", name, (os.clock() - t) / N * 1e9))
 end
 
 local cases = {
-    { "empty method", function() empty:debug("query", fields) end },
-    { "disabled level", function() logger:debug("query", fields) end },
-    { "enabled, message only", function() logger:info("query") end },
-    { "enabled, two fields", function() logger:info("query", fields) end },
-    { "child, two fields", function() child:info("query", fields) end },
-    { "redacted, nested", function() redacting:info("login", secret) end },
-    { "tojson of the fields", function() return tojson(fields) end },
+    {
+        "empty method",
+        function()
+            empty:debug("query", fields)
+        end,
+    },
+    {
+        "disabled level",
+        function()
+            logger:debug("query", fields)
+        end,
+    },
+    {
+        "enabled, message only",
+        function()
+            logger:info("query")
+        end,
+    },
+    {
+        "enabled, two fields",
+        function()
+            logger:info("query", fields)
+        end,
+    },
+    {
+        "child, two fields",
+        function()
+            child:info("query", fields)
+        end,
+    },
+    {
+        "redacted, nested",
+        function()
+            redacting:info("login", secret)
+        end,
+    },
+    {
+        "tojson of the fields",
+        function()
+            return tojson(fields)
+        end,
+    },
 }
+
 for _ = 1, 2 do
     for _, case in ipairs(cases) do
         run(case[1], case[2])
